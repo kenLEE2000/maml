@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple
 
 import numpy as np
@@ -29,41 +28,7 @@ import torch
 from torch import nn, optim
 import random
 
-
-@dataclass
-class SineBatch:
-    """Container for a batch of sinusoid tasks."""
-
-    inputa: torch.Tensor
-    labela: torch.Tensor
-    inputb: torch.Tensor
-    labelb: torch.Tensor
-
-
-class SineGenerator:
-    """Generate batches of sinusoid regression tasks.
-
-    Each task is defined by an amplitude and phase sampled uniformly from
-    predefined ranges.  For each task we generate K points for adaptation and
-    K points for evaluation (where K is ``update_batch_size``).
-    """
-
-    def __init__(self, update_batch_size: int, meta_batch_size: int):
-        self.k = update_batch_size
-        self.meta_batch_size = meta_batch_size
-
-    def sample_batch(self) -> SineBatch:
-        amp = np.random.uniform(0.1, 5.0, size=[self.meta_batch_size])
-        phase = np.random.uniform(0, np.pi, size=[self.meta_batch_size])
-        xs = np.random.uniform(
-            -5.0, 5.0, size=[self.meta_batch_size, self.k * 2, 1]
-        )
-        ys = amp[:, None, None] * np.sin(xs - phase[:, None, None])
-        xa = torch.tensor(xs[:, : self.k], dtype=torch.float32)
-        ya = torch.tensor(ys[:, : self.k], dtype=torch.float32)
-        xb = torch.tensor(xs[:, self.k :], dtype=torch.float32)
-        yb = torch.tensor(ys[:, self.k :], dtype=torch.float32)
-        return SineBatch(xa, ya, xb, yb)
+from data_generator import DataGenerator
 
 
 class MAML(nn.Module):
@@ -110,7 +75,7 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MAML().to(device)
     opt = optim.Adam(model.parameters(), lr=args.meta_lr)
-    generator = SineGenerator(args.update_batch_size, args.meta_batch_size)
+    generator = DataGenerator(args.update_batch_size, args.meta_batch_size)
 
     for itr in range(args.iterations):
         batch = generator.sample_batch()
@@ -149,7 +114,7 @@ def test(args: argparse.Namespace) -> None:
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
     model.eval()
 
-    generator = SineGenerator(args.update_batch_size, args.meta_batch_size)
+    generator = DataGenerator(args.update_batch_size, args.meta_batch_size)
     batch = generator.sample_batch()
     inputa, labela, inputb, labelb = [
         t.to(device) for t in (batch.inputa, batch.labela, batch.inputb, batch.labelb)
