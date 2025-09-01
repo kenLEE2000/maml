@@ -1,348 +1,168 @@
+"""PyTorch implementation of MAML for sinusoid regression.
+
+This script replaces the original TensorFlow based entry point and provides a
+minimal example of training Model-Agnostic Meta-Learning (MAML) using
+PyTorch.  The implementation focuses on the sinusoid regression task described
+in the original MAML paper and mirrors the command line interface of the old
+`main.py` when possible.
+
+Example usage:
+
+```
+# train for a few iterations
+python main.py --train --iterations 500
+
+# evaluate a trained model
+python main.py --test
+```
 """
-Usage Instructions:
-    10-shot sinusoid:
-        python main.py --datasource=sinusoid --logdir=logs/sine/ --metatrain_iterations=70000 --norm=None --update_batch_size=10
 
-    10-shot sinusoid baselines:
-        python main.py --datasource=sinusoid --logdir=logs/sine/ --pretrain_iterations=70000 --metatrain_iterations=0 --norm=None --update_batch_size=10 --baseline=oracle
-        python main.py --datasource=sinusoid --logdir=logs/sine/ --pretrain_iterations=70000 --metatrain_iterations=0 --norm=None --update_batch_size=10
+from __future__ import annotations
 
-    5-way, 1-shot omniglot:
-        python main.py --datasource=omniglot --metatrain_iterations=60000 --meta_batch_size=32 --update_batch_size=1 --update_lr=0.4 --num_updates=1 --logdir=logs/omniglot5way/
+import argparse
+import os
+from typing import Dict, Iterable, Tuple
 
-    20-way, 1-shot omniglot:
-        python main.py --datasource=omniglot --metatrain_iterations=60000 --meta_batch_size=16 --update_batch_size=1 --num_classes=20 --update_lr=0.1 --num_updates=5 --logdir=logs/omniglot20way/
-
-    5-way 1-shot mini imagenet:
-        python main.py --datasource=miniimagenet --metatrain_iterations=60000 --meta_batch_size=4 --update_batch_size=1 --update_lr=0.01 --num_updates=5 --num_classes=5 --logdir=logs/miniimagenet1shot/ --num_filters=32 --max_pool=True
-
-    5-way 5-shot mini imagenet:
-        python main.py --datasource=miniimagenet --metatrain_iterations=60000 --meta_batch_size=4 --update_batch_size=5 --update_lr=0.01 --num_updates=5 --num_classes=5 --logdir=logs/miniimagenet5shot/ --num_filters=32 --max_pool=True
-
-    To run evaluation, use the '--train=False' flag and the '--test_set=True' flag to use the test set.
-
-    For omniglot and miniimagenet training, acquire the dataset online, put it in the correspoding data directory, and see the python script instructions in that directory to preprocess the data.
-
-    Note that better sinusoid results can be achieved by using a larger network.
-"""
-import csv
 import numpy as np
-import pickle
+import torch
+from torch import nn, optim
 import random
-import tensorflow as tf
 
 from data_generator import DataGenerator
-from maml import MAML
-from tensorflow.python.platform import flags
 
-FLAGS = flags.FLAGS
 
-## Dataset/method options
-flags.DEFINE_string('datasource', 'sinusoid', 'sinusoid or omniglot or miniimagenet')
-flags.DEFINE_integer('num_classes', 5, 'number of classes used in classification (e.g. 5-way classification).')
-# oracle means task id is input (only suitable for sinusoid)
-flags.DEFINE_string('baseline', None, 'oracle, or None')
+class MAML(nn.Module):
+    """Simple fully-connected network used for sinusoid regression."""
 
-## Training options
-flags.DEFINE_integer('pretrain_iterations', 0, 'number of pre-training iterations.')
-flags.DEFINE_integer('metatrain_iterations', 15000, 'number of metatraining iterations.') # 15k for omniglot, 50k for sinusoid
-flags.DEFINE_integer('meta_batch_size', 25, 'number of tasks sampled per meta-update')
-flags.DEFINE_float('meta_lr', 0.001, 'the base learning rate of the generator')
-flags.DEFINE_integer('update_batch_size', 5, 'number of examples used for inner gradient update (K for K-shot learning).')
-flags.DEFINE_float('update_lr', 1e-3, 'step size alpha for inner gradient update.') # 0.1 for omniglot
-flags.DEFINE_integer('num_updates', 1, 'number of inner gradient updates during training.')
+    def __init__(self) -> None:
+        super().__init__()
+        self.layer1 = nn.Linear(1, 40)
+        self.layer2 = nn.Linear(40, 40)
+        self.layer3 = nn.Linear(40, 1)
 
-## Model options
-flags.DEFINE_string('norm', 'batch_norm', 'batch_norm, layer_norm, or None')
-flags.DEFINE_integer('num_filters', 64, 'number of filters for conv nets -- 32 for miniimagenet, 64 for omiglot.')
-flags.DEFINE_bool('conv', True, 'whether or not to use a convolutional network, only applicable in some cases')
-flags.DEFINE_bool('max_pool', False, 'Whether or not to use max pooling rather than strided convolutions')
-flags.DEFINE_bool('stop_grad', False, 'if True, do not use second derivatives in meta-optimization (for speed)')
+    def forward(self, x: torch.Tensor, params: Dict[str, torch.Tensor] | None = None) -> torch.Tensor:
+        if params is None:
+            params = dict(self.named_parameters())
+        x = nn.functional.linear(x, params["layer1.weight"], params["layer1.bias"])
+        x = torch.relu(x)
+        x = nn.functional.linear(x, params["layer2.weight"], params["layer2.bias"])
+        x = torch.relu(x)
+        x = nn.functional.linear(x, params["layer3.weight"], params["layer3.bias"])
+        return x
 
-## Logging, saving, and testing options
-flags.DEFINE_bool('log', True, 'if false, do not log summaries, for debugging code.')
-flags.DEFINE_string('logdir', '/tmp/data', 'directory for summaries and checkpoints.')
-flags.DEFINE_bool('resume', True, 'resume training if there is a model available')
-flags.DEFINE_bool('train', True, 'True to train, False to test.')
-flags.DEFINE_integer('test_iter', -1, 'iteration to load model (-1 for latest model)')
-flags.DEFINE_bool('test_set', False, 'Set to true to test on the the test set, False for the validation set.')
-flags.DEFINE_integer('train_update_batch_size', -1, 'number of examples used for gradient update during training (use if you want to test with a different number).')
-flags.DEFINE_float('train_update_lr', -1, 'value of inner gradient step step during training. (use if you want to test with a different value)') # 0.1 for omniglot
+    def adapt(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        params: Dict[str, torch.Tensor] | None = None,
+        lr: float = 0.01,
+        create_graph: bool = True,
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """Perform one inner-loop update and return adapted parameters."""
 
-def train(model, saver, sess, exp_string, data_generator, resume_itr=0):
-    SUMMARY_INTERVAL = 100
-    SAVE_INTERVAL = 1000
-    if FLAGS.datasource == 'sinusoid':
-        PRINT_INTERVAL = 1000
-        TEST_PRINT_INTERVAL = PRINT_INTERVAL*5
+        if params is None:
+            params = dict(self.named_parameters())
+        preds = self.forward(x, params)
+        loss = nn.functional.mse_loss(preds, y)
+        grads = torch.autograd.grad(loss, params.values(), create_graph=create_graph)
+        updated = {
+            name: param - lr * grad for (name, param), grad in zip(params.items(), grads)
+        }
+        return updated, loss
+
+
+def train(args: argparse.Namespace) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MAML().to(device)
+    opt = optim.Adam(model.parameters(), lr=args.meta_lr)
+    generator = DataGenerator(args.update_batch_size, args.meta_batch_size)
+
+    for itr in range(args.iterations):
+        batch = generator.sample_batch()
+        inputa, labela, inputb, labelb = [
+            t.to(device) for t in (batch.inputa, batch.labela, batch.inputb, batch.labelb)
+        ]
+        meta_loss = 0.0
+        for task in range(args.meta_batch_size):
+            params = None
+            for _ in range(args.num_updates):
+                params, _ = model.adapt(
+                    inputa[task], labela[task], params, lr=args.update_lr
+                )
+            preds = model.forward(inputb[task], params)
+            loss = nn.functional.mse_loss(preds, labelb[task])
+            meta_loss += loss
+        meta_loss /= args.meta_batch_size
+        opt.zero_grad()
+        meta_loss.backward()
+        opt.step()
+
+        if (itr + 1) % args.print_interval == 0:
+            print(f"Iteration {itr + 1}: meta loss {meta_loss.item():.4f}")
+
+    torch.save(model.state_dict(), args.checkpoint)
+    print(f"Model saved to {args.checkpoint}")
+
+
+def test(args: argparse.Namespace) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MAML().to(device)
+    if not os.path.exists(args.checkpoint):
+        raise FileNotFoundError(
+            f"Checkpoint {args.checkpoint} not found. Train a model first."
+        )
+    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    model.eval()
+
+    generator = DataGenerator(args.update_batch_size, args.meta_batch_size)
+    batch = generator.sample_batch()
+    inputa, labela, inputb, labelb = [
+        t.to(device) for t in (batch.inputa, batch.labela, batch.inputb, batch.labelb)
+    ]
+
+    losses = []
+    for task in range(args.meta_batch_size):
+        params = None
+        # no need to build higher order derivatives when evaluating
+        for _ in range(args.num_updates):
+            params, _ = model.adapt(
+                inputa[task], labela[task], params, lr=args.update_lr, create_graph=False
+            )
+        preds = model.forward(inputb[task], params)
+        loss = nn.functional.mse_loss(preds, labelb[task])
+        losses.append(loss.item())
+
+    print(f"Mean loss after adaptation: {np.mean(losses):.4f}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="PyTorch implementation of MAML on sinusoid regression"
+    )
+    parser.add_argument("--meta_batch_size", type=int, default=25, help="tasks per meta-update")
+    parser.add_argument("--update_batch_size", type=int, default=10, help="K for K-shot learning")
+    parser.add_argument("--num_updates", type=int, default=1, help="inner gradient steps")
+    parser.add_argument("--meta_lr", type=float, default=1e-3, help="meta learning rate")
+    parser.add_argument("--update_lr", type=float, default=0.01, help="inner learning rate")
+    parser.add_argument("--iterations", type=int, default=10000, help="number of meta-training iterations")
+    parser.add_argument("--checkpoint", type=str, default="maml.pth", help="path to save model")
+    parser.add_argument("--print_interval", type=int, default=100, help="iterations between prints")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--train", action="store_true", help="run training")
+    group.add_argument("--test", action="store_true", help="evaluate a saved model")
+    args = parser.parse_args()
+
+    # Ensure reproducibility for demonstration purposes
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    if args.train:
+        train(args)
     else:
-        PRINT_INTERVAL = 100
-        TEST_PRINT_INTERVAL = PRINT_INTERVAL*5
+        test(args)
 
-    if FLAGS.log:
-        train_writer = tf.summary.FileWriter(FLAGS.logdir + '/' + exp_string, sess.graph)
-    print('Done initializing, starting training.')
-    prelosses, postlosses = [], []
-
-    num_classes = data_generator.num_classes # for classification, 1 otherwise
-    multitask_weights, reg_weights = [], []
-
-    for itr in range(resume_itr, FLAGS.pretrain_iterations + FLAGS.metatrain_iterations):
-        feed_dict = {}
-        if 'generate' in dir(data_generator):
-            batch_x, batch_y, amp, phase = data_generator.generate()
-
-            if FLAGS.baseline == 'oracle':
-                batch_x = np.concatenate([batch_x, np.zeros([batch_x.shape[0], batch_x.shape[1], 2])], 2)
-                for i in range(FLAGS.meta_batch_size):
-                    batch_x[i, :, 1] = amp[i]
-                    batch_x[i, :, 2] = phase[i]
-
-            inputa = batch_x[:, :num_classes*FLAGS.update_batch_size, :]
-            labela = batch_y[:, :num_classes*FLAGS.update_batch_size, :]
-            inputb = batch_x[:, num_classes*FLAGS.update_batch_size:, :] # b used for testing
-            labelb = batch_y[:, num_classes*FLAGS.update_batch_size:, :]
-            feed_dict = {model.inputa: inputa, model.inputb: inputb,  model.labela: labela, model.labelb: labelb}
-
-        if itr < FLAGS.pretrain_iterations:
-            input_tensors = [model.pretrain_op]
-        else:
-            input_tensors = [model.metatrain_op]
-
-        if (itr % SUMMARY_INTERVAL == 0 or itr % PRINT_INTERVAL == 0):
-            input_tensors.extend([model.summ_op, model.total_loss1, model.total_losses2[FLAGS.num_updates-1]])
-            if model.classification:
-                input_tensors.extend([model.total_accuracy1, model.total_accuracies2[FLAGS.num_updates-1]])
-
-        result = sess.run(input_tensors, feed_dict)
-
-        if itr % SUMMARY_INTERVAL == 0:
-            prelosses.append(result[-2])
-            if FLAGS.log:
-                train_writer.add_summary(result[1], itr)
-            postlosses.append(result[-1])
-
-        if (itr!=0) and itr % PRINT_INTERVAL == 0:
-            if itr < FLAGS.pretrain_iterations:
-                print_str = 'Pretrain Iteration ' + str(itr)
-            else:
-                print_str = 'Iteration ' + str(itr - FLAGS.pretrain_iterations)
-            print_str += ': ' + str(np.mean(prelosses)) + ', ' + str(np.mean(postlosses))
-            print(print_str)
-            prelosses, postlosses = [], []
-
-        if (itr!=0) and itr % SAVE_INTERVAL == 0:
-            saver.save(sess, FLAGS.logdir + '/' + exp_string + '/model' + str(itr))
-
-        # sinusoid is infinite data, so no need to test on meta-validation set.
-        if (itr!=0) and itr % TEST_PRINT_INTERVAL == 0 and FLAGS.datasource !='sinusoid':
-            if 'generate' not in dir(data_generator):
-                feed_dict = {}
-                if model.classification:
-                    input_tensors = [model.metaval_total_accuracy1, model.metaval_total_accuracies2[FLAGS.num_updates-1], model.summ_op]
-                else:
-                    input_tensors = [model.metaval_total_loss1, model.metaval_total_losses2[FLAGS.num_updates-1], model.summ_op]
-            else:
-                batch_x, batch_y, amp, phase = data_generator.generate(train=False)
-                inputa = batch_x[:, :num_classes*FLAGS.update_batch_size, :]
-                inputb = batch_x[:, num_classes*FLAGS.update_batch_size:, :]
-                labela = batch_y[:, :num_classes*FLAGS.update_batch_size, :]
-                labelb = batch_y[:, num_classes*FLAGS.update_batch_size:, :]
-                feed_dict = {model.inputa: inputa, model.inputb: inputb,  model.labela: labela, model.labelb: labelb, model.meta_lr: 0.0}
-                if model.classification:
-                    input_tensors = [model.total_accuracy1, model.total_accuracies2[FLAGS.num_updates-1]]
-                else:
-                    input_tensors = [model.total_loss1, model.total_losses2[FLAGS.num_updates-1]]
-
-            result = sess.run(input_tensors, feed_dict)
-            print('Validation results: ' + str(result[0]) + ', ' + str(result[1]))
-
-    saver.save(sess, FLAGS.logdir + '/' + exp_string +  '/model' + str(itr))
-
-# calculated for omniglot
-NUM_TEST_POINTS = 600
-
-def test(model, saver, sess, exp_string, data_generator, test_num_updates=None):
-    num_classes = data_generator.num_classes # for classification, 1 otherwise
-
-    np.random.seed(1)
-    random.seed(1)
-
-    metaval_accuracies = []
-
-    for _ in range(NUM_TEST_POINTS):
-        if 'generate' not in dir(data_generator):
-            feed_dict = {}
-            feed_dict = {model.meta_lr : 0.0}
-        else:
-            batch_x, batch_y, amp, phase = data_generator.generate(train=False)
-
-            if FLAGS.baseline == 'oracle': # NOTE - this flag is specific to sinusoid
-                batch_x = np.concatenate([batch_x, np.zeros([batch_x.shape[0], batch_x.shape[1], 2])], 2)
-                batch_x[0, :, 1] = amp[0]
-                batch_x[0, :, 2] = phase[0]
-
-            inputa = batch_x[:, :num_classes*FLAGS.update_batch_size, :]
-            inputb = batch_x[:,num_classes*FLAGS.update_batch_size:, :]
-            labela = batch_y[:, :num_classes*FLAGS.update_batch_size, :]
-            labelb = batch_y[:,num_classes*FLAGS.update_batch_size:, :]
-
-            feed_dict = {model.inputa: inputa, model.inputb: inputb,  model.labela: labela, model.labelb: labelb, model.meta_lr: 0.0}
-
-        if model.classification:
-            result = sess.run([model.metaval_total_accuracy1] + model.metaval_total_accuracies2, feed_dict)
-        else:  # this is for sinusoid
-            result = sess.run([model.total_loss1] +  model.total_losses2, feed_dict)
-        metaval_accuracies.append(result)
-
-    metaval_accuracies = np.array(metaval_accuracies)
-    means = np.mean(metaval_accuracies, 0)
-    stds = np.std(metaval_accuracies, 0)
-    ci95 = 1.96*stds/np.sqrt(NUM_TEST_POINTS)
-
-    print('Mean validation accuracy/loss, stddev, and confidence intervals')
-    print((means, stds, ci95))
-
-    out_filename = FLAGS.logdir +'/'+ exp_string + '/' + 'test_ubs' + str(FLAGS.update_batch_size) + '_stepsize' + str(FLAGS.update_lr) + '.csv'
-    out_pkl = FLAGS.logdir +'/'+ exp_string + '/' + 'test_ubs' + str(FLAGS.update_batch_size) + '_stepsize' + str(FLAGS.update_lr) + '.pkl'
-    with open(out_pkl, 'wb') as f:
-        pickle.dump({'mses': metaval_accuracies}, f)
-    with open(out_filename, 'w') as f:
-        writer = csv.writer(f, delimiter=',')
-        writer.writerow(['update'+str(i) for i in range(len(means))])
-        writer.writerow(means)
-        writer.writerow(stds)
-        writer.writerow(ci95)
-
-def main():
-    if FLAGS.datasource == 'sinusoid':
-        if FLAGS.train:
-            test_num_updates = 5
-        else:
-            test_num_updates = 10
-    else:
-        if FLAGS.datasource == 'miniimagenet':
-            if FLAGS.train == True:
-                test_num_updates = 1  # eval on at least one update during training
-            else:
-                test_num_updates = 10
-        else:
-            test_num_updates = 10
-
-    if FLAGS.train == False:
-        orig_meta_batch_size = FLAGS.meta_batch_size
-        # always use meta batch size of 1 when testing.
-        FLAGS.meta_batch_size = 1
-
-    if FLAGS.datasource == 'sinusoid':
-        data_generator = DataGenerator(FLAGS.update_batch_size*2, FLAGS.meta_batch_size)
-    else:
-        if FLAGS.metatrain_iterations == 0 and FLAGS.datasource == 'miniimagenet':
-            assert FLAGS.meta_batch_size == 1
-            assert FLAGS.update_batch_size == 1
-            data_generator = DataGenerator(1, FLAGS.meta_batch_size)  # only use one datapoint,
-        else:
-            if FLAGS.datasource == 'miniimagenet': # TODO - use 15 val examples for imagenet?
-                if FLAGS.train:
-                    data_generator = DataGenerator(FLAGS.update_batch_size+15, FLAGS.meta_batch_size)  # only use one datapoint for testing to save memory
-                else:
-                    data_generator = DataGenerator(FLAGS.update_batch_size*2, FLAGS.meta_batch_size)  # only use one datapoint for testing to save memory
-            else:
-                data_generator = DataGenerator(FLAGS.update_batch_size*2, FLAGS.meta_batch_size)  # only use one datapoint for testing to save memory
-
-
-    dim_output = data_generator.dim_output
-    if FLAGS.baseline == 'oracle':
-        assert FLAGS.datasource == 'sinusoid'
-        dim_input = 3
-        FLAGS.pretrain_iterations += FLAGS.metatrain_iterations
-        FLAGS.metatrain_iterations = 0
-    else:
-        dim_input = data_generator.dim_input
-
-    if FLAGS.datasource == 'miniimagenet' or FLAGS.datasource == 'omniglot':
-        tf_data_load = True
-        num_classes = data_generator.num_classes
-
-        if FLAGS.train: # only construct training model if needed
-            random.seed(5)
-            image_tensor, label_tensor = data_generator.make_data_tensor()
-            inputa = tf.slice(image_tensor, [0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1])
-            inputb = tf.slice(image_tensor, [0,num_classes*FLAGS.update_batch_size, 0], [-1,-1,-1])
-            labela = tf.slice(label_tensor, [0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1])
-            labelb = tf.slice(label_tensor, [0,num_classes*FLAGS.update_batch_size, 0], [-1,-1,-1])
-            input_tensors = {'inputa': inputa, 'inputb': inputb, 'labela': labela, 'labelb': labelb}
-
-        random.seed(6)
-        image_tensor, label_tensor = data_generator.make_data_tensor(train=False)
-        inputa = tf.slice(image_tensor, [0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1])
-        inputb = tf.slice(image_tensor, [0,num_classes*FLAGS.update_batch_size, 0], [-1,-1,-1])
-        labela = tf.slice(label_tensor, [0,0,0], [-1,num_classes*FLAGS.update_batch_size, -1])
-        labelb = tf.slice(label_tensor, [0,num_classes*FLAGS.update_batch_size, 0], [-1,-1,-1])
-        metaval_input_tensors = {'inputa': inputa, 'inputb': inputb, 'labela': labela, 'labelb': labelb}
-    else:
-        tf_data_load = False
-        input_tensors = None
-
-    model = MAML(dim_input, dim_output, test_num_updates=test_num_updates)
-    if FLAGS.train or not tf_data_load:
-        model.construct_model(input_tensors=input_tensors, prefix='metatrain_')
-    if tf_data_load:
-        model.construct_model(input_tensors=metaval_input_tensors, prefix='metaval_')
-    model.summ_op = tf.summary.merge_all()
-
-    saver = loader = tf.train.Saver(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES), max_to_keep=10)
-
-    sess = tf.InteractiveSession()
-
-    if FLAGS.train == False:
-        # change to original meta batch size when loading model.
-        FLAGS.meta_batch_size = orig_meta_batch_size
-
-    if FLAGS.train_update_batch_size == -1:
-        FLAGS.train_update_batch_size = FLAGS.update_batch_size
-    if FLAGS.train_update_lr == -1:
-        FLAGS.train_update_lr = FLAGS.update_lr
-
-    exp_string = 'cls_'+str(FLAGS.num_classes)+'.mbs_'+str(FLAGS.meta_batch_size) + '.ubs_' + str(FLAGS.train_update_batch_size) + '.numstep' + str(FLAGS.num_updates) + '.updatelr' + str(FLAGS.train_update_lr)
-
-    if FLAGS.num_filters != 64:
-        exp_string += 'hidden' + str(FLAGS.num_filters)
-    if FLAGS.max_pool:
-        exp_string += 'maxpool'
-    if FLAGS.stop_grad:
-        exp_string += 'stopgrad'
-    if FLAGS.baseline:
-        exp_string += FLAGS.baseline
-    if FLAGS.norm == 'batch_norm':
-        exp_string += 'batchnorm'
-    elif FLAGS.norm == 'layer_norm':
-        exp_string += 'layernorm'
-    elif FLAGS.norm == 'None':
-        exp_string += 'nonorm'
-    else:
-        print('Norm setting not recognized.')
-
-    resume_itr = 0
-    model_file = None
-
-    tf.global_variables_initializer().run()
-    tf.train.start_queue_runners()
-
-    if FLAGS.resume or not FLAGS.train:
-        model_file = tf.train.latest_checkpoint(FLAGS.logdir + '/' + exp_string)
-        if FLAGS.test_iter > 0:
-            model_file = model_file[:model_file.index('model')] + 'model' + str(FLAGS.test_iter)
-        if model_file:
-            ind1 = model_file.index('model')
-            resume_itr = int(model_file[ind1+5:])
-            print("Restoring model weights from " + model_file)
-            saver.restore(sess, model_file)
-
-    if FLAGS.train:
-        train(model, saver, sess, exp_string, data_generator, resume_itr)
-    else:
-        test(model, saver, sess, exp_string, data_generator, test_num_updates)
 
 if __name__ == "__main__":
     main()
+
